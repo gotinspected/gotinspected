@@ -23,7 +23,11 @@ func New(repoPath string, registry *plugins.Registry) *GitAnalyzer {
 }
 
 func (a *GitAnalyzer) Analyze() (*Result, error) {
-	repo, err := git.PlainOpen(a.repoPath)
+	// FIX: Use DetectDotGit so it automatically finds the repo root even if
+	// the positional path points to a deep subdirectory.
+	repo, err := git.PlainOpenWithOptions(a.repoPath, &git.PlainOpenOptions{
+		DetectDotGit: true,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -47,13 +51,11 @@ func (a *GitAnalyzer) Analyze() (*Result, error) {
 		}
 		statsMap[authorName].Commits++
 
-		// 1. Get the tree of the current commit
 		currentTree, err := c.Tree()
 		if err != nil {
 			return err
 		}
 
-		// 2. Get the tree of the parent commit
 		var parentTree *object.Tree
 		if c.NumParents() > 0 {
 			parent, err := c.Parent(0)
@@ -62,8 +64,6 @@ func (a *GitAnalyzer) Analyze() (*Result, error) {
 			}
 		}
 
-		// THE FIX: go-git panics if parentTree is nil.
-		// For the initial commit (0 parents), diff against a completely empty tree.
 		if parentTree == nil {
 			parentTree = &object.Tree{}
 		}
@@ -78,7 +78,6 @@ func (a *GitAnalyzer) Analyze() (*Result, error) {
 			return err
 		}
 
-		// 3. Analyze line-by-line diffs
 		for _, fp := range patch.FilePatches() {
 			from, to := fp.Files()
 			filename := ""

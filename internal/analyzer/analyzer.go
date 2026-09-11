@@ -3,8 +3,10 @@ package analyzer
 import (
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/diff"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/yourusername/gitinspector-go/internal/plugins"
@@ -16,46 +18,84 @@ type GitAnalyzer struct {
 }
 
 func New(repoPath string, registry *plugins.Registry) *GitAnalyzer {
-	return &GitAnalyzer{
-		repoPath: repoPath,
-		registry: registry,
-	}
+	return &GitAnalyzer{repoPath: repoPath, registry: registry}
 }
 
 func (a *GitAnalyzer) Analyze() (*Result, error) {
-	// FIX: Use DetectDotGit so it automatically finds the repo root even if
-	// the positional path points to a deep subdirectory.
-	repo, err := git.PlainOpenWithOptions(a.repoPath, &git.PlainOpenOptions{
-		DetectDotGit: true,
-	})
+	repo, err := git.PlainOpenWithOptions(a.repoPath, &git.PlainOpenOptions{DetectDotGit: true})
 	if err != nil {
 		return nil, err
 	}
 
-	head, err := repo.Head()
+	headRef, err := repo.Head()
 	if err != nil {
 		return nil, err
 	}
 
-	commitIter, err := repo.Log(&git.LogOptions{From: head.Hash()})
+	headCommit, err := repo.CommitObject(headRef.Hash())
 	if err != nil {
 		return nil, err
 	}
 
-	statsMap := make(map[string]*AuthorStat)
+	// 1. Initialize concurrency tools and private stat maps
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	err = commitIter.ForEach(func(c *object.Commit) error {
+	diffStats := make(map[string]*AuthorStat)
+	blameStats := make(map[string]*AuthorStat)
+	var diffErr, blameErr error
+
+	// 2. Run Historical Diff Analysis concurrently
+	go func() {
+		defer wg.Done()
+		diffErr = a.runDiffPhase(repo, headRef, diffStats)
+	}()
+
+	// 3. Run Blame Analysis concurrently
+	go func() {
+		defer wg.Done()
+		blameErr = a.runBlamePhase(repo, headCommit, blameStats)
+	}()
+
+	// Wait for both phases to complete
+	wg.Wait()
+
+	if diffErr != nil {
+		return nil, diffErr
+	}
+	if blameErr != nil {
+		return nil, blameErr
+	}
+
+	// 4. Safely merge the results from both phases
+	finalStats := make(map[string]*AuthorStat)
+	for name, stat := range diffStats {
+		finalStats[name] = stat
+	}
+	for name, bStat := range blameStats {
+		if _, exists := finalStats[name]; !exists {
+			finalStats[name] = &AuthorStat{Name: name}
+		}
+		finalStats[name].CurrentLines += bStat.CurrentLines
+	}
+
+	return a.aggregate(finalStats), nil
+}
+
+func (a *GitAnalyzer) runDiffPhase(repo *git.Repository, headRef *plumbing.Reference, statsMap map[string]*AuthorStat) error {
+	commitIter, err := repo.Log(&git.LogOptions{From: headRef.Hash()})
+	if err != nil {
+		return err
+	}
+
+	return commitIter.ForEach(func(c *object.Commit) error {
 		authorName := c.Author.Name
 		if _, exists := statsMap[authorName]; !exists {
 			statsMap[authorName] = &AuthorStat{Name: authorName}
 		}
 		statsMap[authorName].Commits++
 
-		currentTree, err := c.Tree()
-		if err != nil {
-			return err
-		}
-
+		currentTree, _ := c.Tree()
 		var parentTree *object.Tree
 		if c.NumParents() > 0 {
 			parent, err := c.Parent(0)
@@ -63,20 +103,12 @@ func (a *GitAnalyzer) Analyze() (*Result, error) {
 				parentTree, _ = parent.Tree()
 			}
 		}
-
 		if parentTree == nil {
 			parentTree = &object.Tree{}
 		}
 
-		changes, err := object.DiffTree(parentTree, currentTree)
-		if err != nil {
-			return err
-		}
-
-		patch, err := changes.Patch()
-		if err != nil {
-			return err
-		}
+		changes, _ := object.DiffTree(parentTree, currentTree)
+		patch, _ := changes.Patch()
 
 		for _, fp := range patch.FilePatches() {
 			from, to := fp.Files()
@@ -98,29 +130,83 @@ func (a *GitAnalyzer) Analyze() (*Result, error) {
 				}
 
 				lines := strings.Split(chunk.Content(), "\n")
-				for _, line := range lines {
-					if line == "" {
+				fileAnalyzer := plugin.NewAnalyzer()
+
+				for i, line := range lines {
+					if i == len(lines)-1 && line == "" {
 						continue
 					}
 
-					if plugin.IsSignificant(line) {
+					if chunk.Type() == diff.Add {
+						statsMap[authorName].RawInsertions++
+					}
+					if chunk.Type() == diff.Delete {
+						statsMap[authorName].RawDeletions++
+					}
+
+					switch fileAnalyzer.AnalyzeLine(line) {
+					case plugins.TypeCode:
 						if chunk.Type() == diff.Add {
 							statsMap[authorName].Insertions++
-						} else if chunk.Type() == diff.Delete {
+						}
+						if chunk.Type() == diff.Delete {
 							statsMap[authorName].Deletions++
 						}
+					case plugins.TypeEmpty:
+						statsMap[authorName].EmptyLines++
+					case plugins.TypeComment:
+						statsMap[authorName].Comments++
 					}
 				}
 			}
 		}
 		return nil
 	})
+}
 
+func (a *GitAnalyzer) runBlamePhase(repo *git.Repository, headCommit *object.Commit, statsMap map[string]*AuthorStat) error {
+	headTree, err := headCommit.Tree()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return a.aggregate(statsMap), nil
+	commitCache := make(map[plumbing.Hash]*object.Commit)
+
+	return headTree.Files().ForEach(func(f *object.File) error {
+		plugin := a.registry.Get(f.Name)
+		if plugin.ShouldExclude(f.Name) {
+			return nil
+		}
+
+		blameResult, err := git.Blame(headCommit, f.Name)
+		if err != nil {
+			return nil
+		}
+
+		fileAnalyzer := plugin.NewAnalyzer()
+
+		for _, line := range blameResult.Lines {
+			c, cached := commitCache[line.Hash]
+			if !cached {
+				c, _ = repo.CommitObject(line.Hash)
+				commitCache[line.Hash] = c
+			}
+
+			authorName := line.Author
+			if c != nil {
+				authorName = c.Author.Name
+			}
+
+			if _, exists := statsMap[authorName]; !exists {
+				statsMap[authorName] = &AuthorStat{Name: authorName}
+			}
+
+			if fileAnalyzer.AnalyzeLine(line.Text) == plugins.TypeCode {
+				statsMap[authorName].CurrentLines++
+			}
+		}
+		return nil
+	})
 }
 
 func (a *GitAnalyzer) aggregate(statsMap map[string]*AuthorStat) *Result {
@@ -130,8 +216,14 @@ func (a *GitAnalyzer) aggregate(statsMap map[string]*AuthorStat) *Result {
 		res.TotalCommits += stat.Commits
 		res.TotalIns += stat.Insertions
 		res.TotalDel += stat.Deletions
+		res.TotalRawIns += stat.RawInsertions
+		res.TotalRawDel += stat.RawDeletions
+		res.TotalEmpty += stat.EmptyLines
+		res.TotalComments += stat.Comments
+		res.TotalCurrent += stat.CurrentLines
 	}
 	res.TotalChanges = res.TotalIns + res.TotalDel
+	res.TotalRawChanges = res.TotalRawIns + res.TotalRawDel
 
 	sort.Slice(res.Authors, func(i, j int) bool {
 		impactI := res.Authors[i].Insertions + res.Authors[i].Deletions

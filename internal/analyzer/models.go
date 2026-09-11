@@ -1,18 +1,27 @@
 package analyzer
 
-// AuthorStat holds the activity metrics for a single author.
 type AuthorStat struct {
-	Name       string
-	Commits    int
-	Insertions int
-	Deletions  int
+	Name          string
+	Commits       int
+	Insertions    int
+	Deletions     int
+	RawInsertions int
+	RawDeletions  int
+	EmptyLines    int
+	Comments      int
+	CurrentLines  int
 }
 
-// Result holds the aggregated output of a repository analysis.
 type Result struct {
-	Authors      []*AuthorStat
-	TotalCommits int
-	TotalIns     int
-	TotalDel     int
-	TotalChanges int
+	Authors         []*AuthorStat
+	TotalCommits    int
+	TotalIns        int
+	TotalDel        int
+	TotalChanges    int
+	TotalRawIns     int
+	TotalRawDel     int
+	TotalRawChanges int
+	TotalEmpty      int
+	TotalComments   int
+	TotalCurrent    int
 }

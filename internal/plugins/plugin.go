@@ -1,35 +1,48 @@
 package plugins
 
-// LanguagePlugin defines how a specific programming language is analyzed.
-type LanguagePlugin interface {
+type LineType int
+
+const (
+	TypeCode LineType = iota
+	TypeEmpty
+	TypeComment
+)
+
+// FileAnalyzer encapsulates the state for parsing a single stream of lines.
+type FileAnalyzer interface {
+	AnalyzeLine(line string) LineType
+}
+
+// Language defines metadata and acts as a factory for its FileAnalyzer.
+type Language interface {
 	Name() string
 	Match(filename string) bool
 	ShouldExclude(filename string) bool
-	IsSignificant(line string) bool
+	NewAnalyzer() FileAnalyzer
 }
 
-// Registry holds all loaded plugins.
 type Registry struct {
-	plugins       []LanguagePlugin
-	defaultPlugin LanguagePlugin
+	languages       []Language
+	defaultLanguage Language
 }
 
-// NewRegistry creates a registry with our built-in plugins.
 func NewRegistry() *Registry {
 	return &Registry{
-		plugins: []LanguagePlugin{
-			&GoPlugin{},
+		languages: []Language{
+			&GoLanguage{},
+			&PythonLanguage{},
+			&CLanguage{},
+			&CppLanguage{},
 		},
-		defaultPlugin: &DefaultPlugin{},
+		defaultLanguage: &DefaultLanguage{},
 	}
 }
 
-// Get finds the first matching plugin for a file, or returns the default.
-func (r *Registry) Get(filename string) LanguagePlugin {
-	for _, p := range r.plugins {
-		if p.Match(filename) {
-			return p
+func (r *Registry) Get(filename string) Language {
+	for _, l := range r.languages {
+		if l.Match(filename) {
+			return l
 		}
 	}
-	return r.defaultPlugin
+	return r.defaultLanguage
 }

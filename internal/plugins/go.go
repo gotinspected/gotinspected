@@ -5,29 +5,48 @@ import (
 	"strings"
 )
 
-type GoPlugin struct{}
+// --- Factory ---
 
-func (p *GoPlugin) Name() string { return "Go" }
+type GoLanguage struct{}
 
-func (p *GoPlugin) Match(filename string) bool {
-	return filepath.Ext(filename) == ".go"
+func (l *GoLanguage) Name() string               { return "Go" }
+func (l *GoLanguage) Match(filename string) bool { return filepath.Ext(filename) == ".go" }
+func (l *GoLanguage) ShouldExclude(filename string) bool {
+	return strings.HasSuffix(filename, ".pb.go")
+}
+func (l *GoLanguage) NewAnalyzer() FileAnalyzer {
+	return &goAnalyzer{} // Spawn a fresh, stateful analyzer
 }
 
-func (p *GoPlugin) ShouldExclude(filename string) bool {
-	// Example: Exclude generated protobufs or mock files
-	if strings.HasSuffix(filename, ".pb.go") {
-		return true
-	}
-	return false
+// --- Stateful Analyzer ---
+
+type goAnalyzer struct {
+	inBlockComment bool
 }
 
-func (p *GoPlugin) IsSignificant(line string) bool {
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return false
+func (a *goAnalyzer) AnalyzeLine(line string) LineType {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return TypeEmpty
 	}
-	if strings.HasPrefix(line, "//") {
-		return false
+
+	if a.inBlockComment {
+		if strings.Contains(trimmed, "*/") {
+			a.inBlockComment = false
+		}
+		return TypeComment
 	}
-	return true
+
+	if strings.HasPrefix(trimmed, "/*") {
+		if !strings.Contains(trimmed, "*/") {
+			a.inBlockComment = true
+		}
+		return TypeComment
+	}
+
+	if strings.HasPrefix(trimmed, "//") {
+		return TypeComment
+	}
+
+	return TypeCode
 }

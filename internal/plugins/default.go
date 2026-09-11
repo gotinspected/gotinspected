@@ -2,11 +2,24 @@ package plugins
 
 import "strings"
 
-type DefaultPlugin struct{}
+// --- Factory ---
 
-func (p *DefaultPlugin) Name() string { return "Default" }
-func (p *DefaultPlugin) Match(filename string) bool { return true }
-func (p *DefaultPlugin) ShouldExclude(filename string) bool { return false }
-func (p *DefaultPlugin) IsSignificant(line string) bool {
-	return strings.TrimSpace(line) != ""
+type DefaultLanguage struct{}
+
+func (l *DefaultLanguage) Name() string                       { return "Default" }
+func (l *DefaultLanguage) Match(filename string) bool         { return true }
+func (l *DefaultLanguage) ShouldExclude(filename string) bool { return false }
+func (l *DefaultLanguage) NewAnalyzer() FileAnalyzer {
+	return &defaultAnalyzer{}
+}
+
+// --- Stateless Analyzer ---
+
+type defaultAnalyzer struct{}
+
+func (a *defaultAnalyzer) AnalyzeLine(line string) LineType {
+	if strings.TrimSpace(line) == "" {
+		return TypeEmpty
+	}
+	return TypeCode
 }

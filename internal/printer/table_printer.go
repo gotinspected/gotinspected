@@ -16,7 +16,7 @@ func NewTablePrinter() *TablePrinter { return &TablePrinter{} }
 
 func (t *TablePrinter) Print(result *analyzer.Result) {
 	if len(result.Authors) == 0 {
-		fmt.Println("No activity found.")
+		fmt.Println("No activity found for the specified criteria.")
 		return
 	}
 
@@ -26,17 +26,19 @@ func (t *TablePrinter) Print(result *analyzer.Result) {
 	tw.Style().Title.Align = text.AlignCenter
 	tw.Style().Title.Colors = text.Colors{text.FgHiCyan}
 	tw.Style().Color.Header = text.Colors{text.FgHiWhite}
-	tw.Style().Options.SeparateRows = false
+
+	// Add slight spacing between rows since we are using multiline author cells now
+	tw.Style().Options.SeparateRows = true
 
 	tw.SetTitle("📊 GITINSPECTOR CODE IMPACT")
-	// NEW: Current Lines header
 	tw.AppendHeader(table.Row{"Author", "Commits", "Raw (+/-)", "Code (+/-)", "Current Lines", "Noise Breakdown", "Impact Share"})
 
 	tw.SetColumnConfigs([]table.ColumnConfig{
+		{Number: 1, Align: text.AlignLeft},
 		{Number: 2, Align: text.AlignRight},
 		{Number: 3, Align: text.AlignCenter},
 		{Number: 4, Align: text.AlignCenter},
-		{Number: 5, Align: text.AlignRight}, // Align Current Lines
+		{Number: 5, Align: text.AlignRight},
 		{Number: 6, Align: text.AlignRight},
 		{Number: 7, Align: text.AlignLeft},
 	})
@@ -60,16 +62,20 @@ func (t *TablePrinter) Print(result *analyzer.Result) {
 		}
 
 		bar := renderProgressBar(impactPercent, 12)
+
+		// NEW: Format the author column to show "Name \n <email>"
+		authorStr := fmt.Sprintf("%s\n%s", author.Name, gray.Sprintf("<%s>", author.Email))
+
 		commitsStr := cyan.Sprintf("%d", author.Commits)
 		rawStr := gray.Sprintf("+%d / -%d", author.RawInsertions, author.RawDeletions)
 		sigStr := fmt.Sprintf("%s / %s", green.Sprintf("+%d", author.Insertions), red.Sprintf("-%d", author.Deletions))
-		currentStr := green.Sprintf("%d", author.CurrentLines) // Render Current Lines
+		currentStr := green.Sprintf("%d", author.CurrentLines)
 
 		noiseStr := gray.Sprintf("%.1f%% (💬 %d | ∅ %d)", noisePercent, author.Comments, author.EmptyLines)
 		shareStr := fmt.Sprintf("%s %s", bar, yellow.Sprintf("%.1f%%", impactPercent))
 
 		tw.AppendRow(table.Row{
-			author.Name, commitsStr, rawStr, sigStr, currentStr, noiseStr, shareStr,
+			authorStr, commitsStr, rawStr, sigStr, currentStr, noiseStr, shareStr,
 		})
 	}
 

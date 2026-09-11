@@ -37,7 +37,6 @@ func (a *GitAnalyzer) Analyze() (*Result, error) {
 		return nil, err
 	}
 
-	// 1. Initialize concurrency tools and private stat maps
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -45,19 +44,16 @@ func (a *GitAnalyzer) Analyze() (*Result, error) {
 	blameStats := make(map[string]*AuthorStat)
 	var diffErr, blameErr error
 
-	// 2. Run Historical Diff Analysis concurrently
 	go func() {
 		defer wg.Done()
 		diffErr = a.runDiffPhase(repo, headRef, diffStats)
 	}()
 
-	// 3. Run Blame Analysis concurrently
 	go func() {
 		defer wg.Done()
 		blameErr = a.runBlamePhase(repo, headCommit, blameStats)
 	}()
 
-	// Wait for both phases to complete
 	wg.Wait()
 
 	if diffErr != nil {
@@ -67,16 +63,16 @@ func (a *GitAnalyzer) Analyze() (*Result, error) {
 		return nil, blameErr
 	}
 
-	// 4. Safely merge the results from both phases
+	// Merge the results using EMAIL as the unique identifier
 	finalStats := make(map[string]*AuthorStat)
-	for name, stat := range diffStats {
-		finalStats[name] = stat
+	for email, stat := range diffStats {
+		finalStats[email] = stat
 	}
-	for name, bStat := range blameStats {
-		if _, exists := finalStats[name]; !exists {
-			finalStats[name] = &AuthorStat{Name: name}
+	for email, bStat := range blameStats {
+		if _, exists := finalStats[email]; !exists {
+			finalStats[email] = &AuthorStat{Name: bStat.Name, Email: email}
 		}
-		finalStats[name].CurrentLines += bStat.CurrentLines
+		finalStats[email].CurrentLines += bStat.CurrentLines
 	}
 
 	return a.aggregate(finalStats), nil
@@ -89,11 +85,18 @@ func (a *GitAnalyzer) runDiffPhase(repo *git.Repository, headRef *plumbing.Refer
 	}
 
 	return commitIter.ForEach(func(c *object.Commit) error {
-		authorName := c.Author.Name
-		if _, exists := statsMap[authorName]; !exists {
-			statsMap[authorName] = &AuthorStat{Name: authorName}
+		if c.NumParents() > 1 {
+			return nil
 		}
-		statsMap[authorName].Commits++
+
+		// Use Email as the primary identity key
+		authorEmail := strings.ToLower(strings.TrimSpace(c.Author.Email))
+		authorName := c.Author.Name
+
+		if _, exists := statsMap[authorEmail]; !exists {
+			statsMap[authorEmail] = &AuthorStat{Name: authorName, Email: authorEmail}
+		}
+		statsMap[authorEmail].Commits++
 
 		currentTree, _ := c.Tree()
 		var parentTree *object.Tree
@@ -124,38 +127,41 @@ func (a *GitAnalyzer) runDiffPhase(repo *git.Repository, headRef *plumbing.Refer
 				continue
 			}
 
-			for _, chunk := range fp.Chunks() {
-				if chunk.Type() == diff.Equal {
-					continue
-				}
+			fileAnalyzer := plugin.NewAnalyzer()
 
+			for _, chunk := range fp.Chunks() {
 				lines := strings.Split(chunk.Content(), "\n")
-				fileAnalyzer := plugin.NewAnalyzer()
 
 				for i, line := range lines {
 					if i == len(lines)-1 && line == "" {
 						continue
 					}
 
-					if chunk.Type() == diff.Add {
-						statsMap[authorName].RawInsertions++
-					}
-					if chunk.Type() == diff.Delete {
-						statsMap[authorName].RawDeletions++
+					lineType := fileAnalyzer.AnalyzeLine(line)
+
+					if chunk.Type() == diff.Equal {
+						continue
 					}
 
-					switch fileAnalyzer.AnalyzeLine(line) {
+					if chunk.Type() == diff.Add {
+						statsMap[authorEmail].RawInsertions++
+					}
+					if chunk.Type() == diff.Delete {
+						statsMap[authorEmail].RawDeletions++
+					}
+
+					switch lineType {
 					case plugins.TypeCode:
 						if chunk.Type() == diff.Add {
-							statsMap[authorName].Insertions++
+							statsMap[authorEmail].Insertions++
 						}
 						if chunk.Type() == diff.Delete {
-							statsMap[authorName].Deletions++
+							statsMap[authorEmail].Deletions++
 						}
 					case plugins.TypeEmpty:
-						statsMap[authorName].EmptyLines++
+						statsMap[authorEmail].EmptyLines++
 					case plugins.TypeComment:
-						statsMap[authorName].Comments++
+						statsMap[authorEmail].Comments++
 					}
 				}
 			}
@@ -179,12 +185,35 @@ func (a *GitAnalyzer) runBlamePhase(repo *git.Repository, headCommit *object.Com
 		}
 
 		blameResult, err := git.Blame(headCommit, f.Name)
+
 		if err != nil {
+			fallbackEmail := "unknown@blame.failed"
+			fallbackName := "Unknown (Blame Failed)"
+
+			logIter, errLog := repo.Log(&git.LogOptions{From: headCommit.Hash, FileName: &f.Name})
+			if errLog == nil {
+				if lastCommit, errNext := logIter.Next(); errNext == nil {
+					fallbackEmail = strings.ToLower(strings.TrimSpace(lastCommit.Author.Email))
+					fallbackName = lastCommit.Author.Name
+				}
+			}
+
+			if _, exists := statsMap[fallbackEmail]; !exists {
+				statsMap[fallbackEmail] = &AuthorStat{Name: fallbackName, Email: fallbackEmail}
+			}
+
+			fileAnalyzer := plugin.NewAnalyzer()
+			if lines, errLines := f.Lines(); errLines == nil {
+				for _, lineText := range lines {
+					if fileAnalyzer.AnalyzeLine(lineText) == plugins.TypeCode {
+						statsMap[fallbackEmail].CurrentLines++
+					}
+				}
+			}
 			return nil
 		}
 
 		fileAnalyzer := plugin.NewAnalyzer()
-
 		for _, line := range blameResult.Lines {
 			c, cached := commitCache[line.Hash]
 			if !cached {
@@ -192,17 +221,19 @@ func (a *GitAnalyzer) runBlamePhase(repo *git.Repository, headCommit *object.Com
 				commitCache[line.Hash] = c
 			}
 
+			authorEmail := strings.ToLower(strings.TrimSpace(line.Author))
 			authorName := line.Author
 			if c != nil {
+				authorEmail = strings.ToLower(strings.TrimSpace(c.Author.Email))
 				authorName = c.Author.Name
 			}
 
-			if _, exists := statsMap[authorName]; !exists {
-				statsMap[authorName] = &AuthorStat{Name: authorName}
+			if _, exists := statsMap[authorEmail]; !exists {
+				statsMap[authorEmail] = &AuthorStat{Name: authorName, Email: authorEmail}
 			}
 
 			if fileAnalyzer.AnalyzeLine(line.Text) == plugins.TypeCode {
-				statsMap[authorName].CurrentLines++
+				statsMap[authorEmail].CurrentLines++
 			}
 		}
 		return nil

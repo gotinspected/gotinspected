@@ -2,6 +2,7 @@ package analyzer
 
 type AuthorStat struct {
 	Name          string
+	Email         string
 	Commits       int
 	Insertions    int
 	Deletions     int
